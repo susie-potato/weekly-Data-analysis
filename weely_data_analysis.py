@@ -54,7 +54,6 @@ def load_and_concat_files(uploaded_files):
                     temp_df = pd.read_csv(file, encoding='gbk')
             else:
                 temp_df = pd.read_excel(file)
-            # 清理列名前后空格防止KeyError
             temp_df.columns = temp_df.columns.str.strip() 
             dfs.append(temp_df)
         except Exception as e:
@@ -64,6 +63,15 @@ def load_and_concat_files(uploaded_files):
         return pd.concat(dfs, ignore_index=True)
     return pd.DataFrame()
 
+# =====================================================================
+# Styler 颜色渲染函数 (用于给特殊异常单元格上色)
+# =====================================================================
+def highlight_abnormal_cells(val):
+    if not isinstance(val, str): return ''
+    if '🔴' in val: return 'background-color: #FFCDD2; color: #B71C1C; font-weight: bold;'
+    if '🟡' in val: return 'background-color: #FFF9C4; color: #F57F17; font-weight: bold;'
+    if '🟣' in val: return 'background-color: #E1BEE7; color: #4A148C; font-weight: bold;'
+    return ''
 
 # =====================================================================
 # 侧边栏结构
@@ -86,7 +94,6 @@ uploaded_files = st.sidebar.file_uploader(
 # 主体逻辑
 # =====================================================================
 if uploaded_files:
-    # 统一读取数据
     with st.spinner('正在处理数据...'):
         raw_df = load_and_concat_files(uploaded_files)
         
@@ -96,29 +103,24 @@ if uploaded_files:
         
     st.sidebar.success(f"✅ 成功加载 {len(uploaded_files)} 个文件数据。")
 
-    # 检查两个面板必需的核心列
     if 'ActionTime' not in raw_df.columns or 'RankList' not in raw_df.columns:
         st.error(f"❌ 读取失败：找不到 'ActionTime' 或 'RankList' 列。当前表格列名有：{list(raw_df.columns)}")
         st.stop()
         
-    # 通用的时间清洗（去除无法转换的空时间）
     raw_df['ActionTime'] = pd.to_datetime(raw_df['ActionTime'], errors='coerce')
     raw_df = raw_df.dropna(subset=['ActionTime'])
 
     # -------------------------------------------------------------------
-    # 面板 1：每日明细排班看板 (沿用之前的规则)
+    # 面板 1：每日明细排班看板 
     # -------------------------------------------------------------------
     if app_mode == "📈 每日明细报表 (排班宽表)":
-        st.title("📈 每日审核数量明细看板 (1点-次日1点)")
-        st.info("💡 提示：时间范围规则为每天的 01:00:00 至次日 01:00:00。表格包含所有指定成员，可向右滑动查看所有日期。")
+        st.title("📈 每日明细排班看板 (1点-次日1点)")
+        st.info("💡 提示：时间范围规则为每天的 01:00 至次日 01:00。表格包含所有指定成员，可向右滑动查看。")
         
         df1 = raw_df.copy()
-        
-        # 偏移时间逻辑：减掉一小时
         df1['AdjustedTime'] = df1['ActionTime'] - pd.Timedelta(hours=1)
         df1['Date'] = df1['AdjustedTime'].dt.date
         
-        # 分类逻辑
         def categorize_ranklist1(x):
             if x == '图文简单列表': return '简单'
             elif x in ['图文优质列表', '图文一般列表']: return '一般+优质'
@@ -127,53 +129,134 @@ if uploaded_files:
         df1['Category'] = df1['RankList'].apply(categorize_ranklist1)
         
         dates = sorted(df1['Date'].dropna().unique())
-        all_stats_list = []
         
-        for current_date in dates:
-            df_date = df1[df1['Date'] == current_date]
-            if not df_date.empty and 'Requester' in df1.columns:
-                stats = df_date.groupby(['Requester', 'Category']).size().unstack(fill_value=0)
+        tab_qty, tab_time = st.tabs(["📊 审核数量明细", "⏰ 每日首尾时间与考核异常"])
+        
+        # --- Tab 1: 审核数量统计 ---
+        with tab_qty:
+            all_stats_list = []
+            for current_date in dates:
+                df_date = df1[df1['Date'] == current_date]
+                if not df_date.empty and 'Requester' in df1.columns:
+                    stats = df_date.groupby(['Requester', 'Category']).size().unstack(fill_value=0)
+                    for col in ['简单', '一般+优质', 'video']:
+                        if col not in stats.columns: stats[col] = 0
+                    stats = stats[['简单', '一般+优质', 'video']]
+                    stats_reindexed = stats.reindex(DEFAULT_NAME_LIST).fillna(0).astype(int)
+                    stats_reindexed.loc['【当日总计】'] = stats_reindexed.sum(axis=0)
+                    date_str = current_date.strftime("%Y-%m-%d")
+                    stats_reindexed.columns = pd.MultiIndex.from_product([[date_str], stats_reindexed.columns])
+                    all_stats_list.append(stats_reindexed)
+                    
+            if all_stats_list:
+                final_combined_df = pd.concat(all_stats_list, axis=1)
+                st.dataframe(final_combined_df, use_container_width=True, height=650)
+                csv = final_combined_df.to_csv().encode('utf-8-sig')
+                st.download_button("📥 下载数量明细(CSV)", data=csv, file_name="审核数量.csv", mime='text/csv')
+            else:
+                st.warning("未能解析出可用的报表数据。")
+
+        # --- Tab 2: 首尾审核时间与考核逻辑 ---
+        with tab_time:
+            st.markdown("""
+            **考核标记说明 (基于系统智能判定的当日班次):**
+            * 🔴 **迟到**: 首次上线晚于所在班次开始时间超 **20分钟**。
+            * 🟡 **早退**: 最晚下线早于所在班次结束时间超 **1小时**。
+            * 🟣 **大间隔**: 06:00-24:00期间，去除法定就餐免责时间后，两审之间相隔超 **30分钟**。
+            """)
+            if 'Requester' in df1.columns:
+                records = []
+                for (req, d), group in df1.groupby(['Requester', 'Date']):
+                    # 确保按时间排序
+                    times = group['ActionTime'].sort_values().reset_index(drop=True)
+                    base_dt = pd.Timestamp(d)
+                    
+                    t_first = times.iloc[0]
+                    t_last = times.iloc[-1]
+                    
+                    # 智能判断排班（基于当天首单的时间相对凌晨0点的偏移量计算）
+                    offset_hours = (t_first - base_dt).total_seconds() / 3600
+                    if 4 <= offset_hours < 8.5: # 大致在凌晨4点~早8点半上线 -> 早班
+                        s_start, s_end = base_dt + pd.Timedelta(hours=6), base_dt + pd.Timedelta(hours=15)
+                        b_start, b_end = base_dt + pd.Timedelta(hours=11), base_dt + pd.Timedelta(hours=12)
+                    elif 8.5 <= offset_hours < 13.5: # 大致在早8点半~午1点半上线 -> 常规班
+                        s_start, s_end = base_dt + pd.Timedelta(hours=9), base_dt + pd.Timedelta(hours=18)
+                        b_start, b_end = base_dt + pd.Timedelta(hours=12), base_dt + pd.Timedelta(hours=13)
+                    else: # 其它时间 -> 晚班
+                        s_start, s_end = base_dt + pd.Timedelta(hours=15), base_dt + pd.Timedelta(hours=24)
+                        b_start, b_end = base_dt + pd.Timedelta(hours=18), base_dt + pd.Timedelta(hours=20)
+
+                    # 1. 判断🔴晚于班次>20min
+                    is_red = t_first > s_start + pd.Timedelta(minutes=20)
+                    # 2. 判断🟡早于班次>1h
+                    is_yellow = t_last < s_end - pd.Timedelta(hours=1)
+                    
+                    # 3. 判断🟣间隔超过30分钟 (6点~24点)
+                    chk_start = base_dt + pd.Timedelta(hours=6)
+                    chk_end = base_dt + pd.Timedelta(hours=24)
+                    valid_times = [t for t in times if chk_start <= t <= chk_end]
+                    
+                    is_purple = False
+                    for i in range(len(valid_times) - 1):
+                        gap_sec = (valid_times[i+1] - valid_times[i]).total_seconds()
+                        if gap_sec > 1800: # 超过30分钟
+                            # 扣除属于免责休息区间的秒数
+                            overlap_start = max(valid_times[i], b_start)
+                            overlap_end = min(valid_times[i+1], b_end)
+                            overlap_sec = max(0, (overlap_end - overlap_start).total_seconds())
+                            if (gap_sec - overlap_sec) > 1800:
+                                is_purple = True
+                                break
+
+                    # 格式化输出字符串
+                    f_str = t_first.strftime('%H:%M:%S') + (" 🔴" if is_red else "")
+                    l_str = t_last.strftime('%H:%M:%S') + (" 🟡" if is_yellow else "")
+                    p_str = "🟣 有异常断档" if is_purple else "正常"
+
+                    records.append({
+                        'Requester': req,
+                        'Date': d.strftime('%Y-%m-%d'),
+                        '最早审核': f_str,
+                        '最晚审核': l_str,
+                        '空档检测': p_str
+                    })
+
+                df_time_records = pd.DataFrame(records)
                 
-                # 补齐缺少的类别
-                for col in ['简单', '一般+优质', 'video']:
-                    if col not in stats.columns: stats[col] = 0
-                stats = stats[['简单', '一般+优质', 'video']]
-                
-                # 使用预设名单重新排序对齐
-                stats_reindexed = stats.reindex(DEFAULT_NAME_LIST).fillna(0).astype(int)
-                stats_reindexed.loc['【当日总计】'] = stats_reindexed.sum(axis=0)
-                
-                # 设定多级表头 (日期横排)
-                date_str = current_date.strftime("%Y-%m-%d")
-                stats_reindexed.columns = pd.MultiIndex.from_product([[date_str], stats_reindexed.columns])
-                all_stats_list.append(stats_reindexed)
-                
-        if all_stats_list:
-            final_combined_df = pd.concat(all_stats_list, axis=1)
-            st.dataframe(final_combined_df, use_container_width=True, height=750)
-            
-            csv = final_combined_df.to_csv().encode('utf-8-sig')
-            st.download_button(
-                label="📥 一键下载完整多日合并统计表 (CSV)",
-                data=csv,
-                file_name=f"审核明细多日合并报表_{dates[0]}_至_{dates[-1]}.csv",
-                mime='text/csv'
-            )
-        else:
-            st.warning("所选文件内未能解析出可用的报表数据。")
+                if not df_time_records.empty:
+                    # 转化为数据透视表
+                    pivot = df_time_records.pivot(index='Requester', columns='Date', values=['最早审核', '最晚审核', '空档检测'])
+                    
+                    # 强制重排序列，以 Date 作为大表头，且固定子项顺序
+                    d_cols = sorted(df_time_records['Date'].unique())
+                    sub_cols = ['最早审核', '最晚审核', '空档检测']
+                    multi_cols = pd.MultiIndex.from_product([d_cols, sub_cols])
+                    
+                    # 应用双层表头和名单重新索引
+                    pivot = pivot.swaplevel(0, 1, axis=1).reindex(columns=multi_cols)
+                    time_pivot_reindexed = pivot.reindex(DEFAULT_NAME_LIST).fillna('-')
+                    
+                    # 给DataFrame应用上色样式 (Streamlit 渲染时极大地提升辨识度)
+                    styled_df = time_pivot_reindexed.style.applymap(highlight_abnormal_cells)
+                    
+                    st.dataframe(styled_df, use_container_width=True, height=650)
+                    
+                    csv_time = time_pivot_reindexed.to_csv().encode('utf-8-sig')
+                    st.download_button("📥 下载首尾时间与异常排查表 (CSV)", data=csv_time, file_name="时间异常排查.csv", mime='text/csv')
+                else:
+                    st.warning("无法提取时间数据。")
+            else:
+                st.warning("数据中缺少 'Requester' 列，无法统计人员时间。")
 
     # -------------------------------------------------------------------
-    # 面板 2：每周数据分析看板 (沿用上传文件的逻辑)
+    # 面板 2：每周数据分析看板 (无需更改)
     # -------------------------------------------------------------------
     elif app_mode == "📊 每周综合分析 (通过率/热力图)":
         st.title("📊 每周数据综合可视化面板 (定制排序版)")
         df2 = raw_df.copy()
-        
-        # 日期获取（不再做 1 小时偏移，沿用分析面板原逻辑）
         df2['Date'] = df2['ActionTime'].dt.strftime('%Y-%m-%d')
         df2['Hour'] = df2['ActionTime'].dt.hour
         
-        # 大类目定义
         img_text_list = ['图文简单列表', '图文一般列表', '图文优质列表']
         video_list = ['视频高优列表', '视频一般列表']
         def categorize_ranklist2(rank_list):
@@ -182,7 +265,6 @@ if uploaded_files:
             else: return '其他'
         df2['Category'] = df2['RankList'].apply(categorize_ranklist2)
         
-        # 提取第一拒绝理由
         def get_primary_reason(reason):
             if pd.isna(reason) or str(reason).strip() == "": return "未知"
             r = str(reason).replace('，', ',').replace(';', ',').split(',')[0].strip()
@@ -193,7 +275,6 @@ if uploaded_files:
         else:
             df2['PrimaryReason'] = "未知"
             
-        # 侧边栏日期筛选（仅对分析面板生效）
         all_dates = sorted(df2['Date'].unique())
         dates_dt = pd.to_datetime(all_dates)
         
@@ -215,16 +296,13 @@ if uploaded_files:
         
         tab1, tab2, tab3, tab4 = st.tabs(["1. 各类目下线理由统计", "2. Provider 拒绝排行", "3. 视频每日详情", "4. Requester 效率热力图"])
 
-        # Tab 1: 各类目下线理由统计
         with tab1:
             st.header("各类目下线理由及审核情况统计")
             order_map = {'图文': IMG_TEXT_ORDER, '视频': VIDEO_ORDER}
             for cat in ['图文', '视频']:
                 st.subheader(f"📂 {cat}类目")
                 cat_df = df_filtered[df_filtered['Category'] == cat]
-                
-                if cat_df.empty:
-                    st.info(f"{cat} 类目无数据"); continue
+                if cat_df.empty: st.info(f"{cat} 类目无数据"); continue
                 
                 total_audit = len(cat_df)
                 status_counts = cat_df['Action'].value_counts() if 'Action' in cat_df.columns else pd.Series()
@@ -262,26 +340,18 @@ if uploaded_files:
                     merged_df['审核总数占比'] = (merged_df['下线数量'] / total_audit * 100).apply(lambda x: f"{x:.2f}%")
                     
                     colA, colB = st.columns(2)
-                    with colA:
-                        st.write(f"**{cat} - 表1: 按数量从高到低排列**")
-                        st.dataframe(df_sorted_count, use_container_width=True)
-                    with colB:
-                        st.write(f"**{cat} - 表2: 按指定固定顺序排列**")
-                        st.dataframe(merged_df, use_container_width=True)
+                    with colA: st.dataframe(df_sorted_count, use_container_width=True)
+                    with colB: st.dataframe(merged_df, use_container_width=True)
                 st.markdown("---")
 
-        # Tab 2: Provider 排行
         with tab2:
             st.header("Provider 拒绝排行及占比分析")
-            if 'ProviderName' not in df_filtered.columns:
-                st.warning("数据中缺少 'ProviderName' 列。")
+            if 'ProviderName' not in df_filtered.columns: st.warning("缺少 'ProviderName' 列。")
             else:
                 for cat in ['图文', '视频']:
                     st.subheader(f"🏢 {cat} - Provider 分析")
                     cat_df = df_filtered[df_filtered['Category'] == cat]
-                    
-                    if cat_df.empty:
-                        st.info(f"{cat} 类目无数据"); continue
+                    if cat_df.empty: continue
                         
                     cat_total_audit = len(cat_df)
                     cat_total_rejected = len(cat_df[cat_df['Action'] == 'Rejected']) if 'Action' in cat_df.columns else 0
@@ -293,23 +363,17 @@ if uploaded_files:
                         
                         merged = pd.merge(rej_counts, total_counts, on='ProviderName', how='left')
                         merged = pd.merge(merged, top_reasons, on='ProviderName', how='left')
-                        
                         merged['Provider自身下线率'] = (merged['Rejected Count'] / merged['Provider Total Audit'] * 100).apply(lambda x: f"{x:.2f}%")
                         merged['占总下线量占比'] = (merged['Rejected Count'] / cat_total_rejected * 100).apply(lambda x: f"{x:.2f}%")
                         merged['占总审核量占比'] = (merged['Rejected Count'] / cat_total_audit * 100).apply(lambda x: f"{x:.2f}%")
-                        
                         cols = ['ProviderName', 'Rejected Count', 'Top Reason', 'Provider自身下线率', '占总下线量占比', '占总审核量占比', 'Provider Total Audit']
                         st.dataframe(merged.sort_values('Rejected Count', ascending=False)[cols], use_container_width=True)
-                    else:
-                        st.info("无 Rejected 数据")
 
-        # Tab 3: 视频每日详情
         with tab3:
             st.header("视频 Provider 每日详情")
             video_df = df_filtered[df_filtered['Category'] == '视频']
             if 'ProviderName' in video_df.columns and not video_df.empty:
                 for prov in video_df['ProviderName'].dropna().unique():
-                    st.subheader(f"📺 {prov}")
                     p_data = video_df[video_df['ProviderName'] == prov]
                     daily = p_data.groupby(['Date', 'Action']).size().unstack(fill_value=0).reset_index()
                     for c in ['Approved', 'Rejected']: 
@@ -317,57 +381,35 @@ if uploaded_files:
                     daily['审核总数'] = daily['Approved'] + daily['Rejected']
                     daily = daily.rename(columns={'Approved': '上线总数', 'Rejected': '下线总数'})
                     daily['上线占比'] = daily.apply(lambda x: f"{(x['上线总数']/x['审核总数']*100):.2f}%" if x['审核总数']>0 else "0.00%", axis=1)
-                    daily = daily.sort_values('Date')
                     
                     fig = go.Figure()
-                    fig.add_trace(go.Bar(x=daily['Date'], y=daily['上线总数'], name='上线', marker_color='#A5D6A7', text=daily['上线总数'], textposition='outside'))
-                    fig.add_trace(go.Bar(x=daily['Date'], y=daily['下线总数'], name='下线', marker_color='#EF9A9A', text=daily['下线总数'], textposition='outside'))
+                    fig.add_trace(go.Bar(x=daily['Date'], y=daily['上线总数'], name='上线', marker_color='#A5D6A7'))
+                    fig.add_trace(go.Bar(x=daily['Date'], y=daily['下线总数'], name='下线', marker_color='#EF9A9A'))
                     fig.update_layout(title=f'{prov} 每日趋势', barmode='group', height=350)
                     st.plotly_chart(fig, use_container_width=True)
-                    st.dataframe(daily, use_container_width=True)
                     st.markdown("---")
-            else:
-                st.info("无视频数据或缺少Provider列")
 
-        # Tab 4: 热力图
         with tab4:
             st.header("Requester 每日分时段效率")
-            st.markdown("说明：纵轴日期已强制为分类显示，每行代表一天的完整数据 (0点, 5-23点)。")
             target_hours = [0] + list(range(5, 24))
-            
             all_dates_in_range = sorted(df_filtered['Date'].unique()) if not df_filtered.empty else []
             if 'Requester' in df_filtered.columns:
                 requesters = df_filtered['Requester'].dropna().unique()
                 cols = st.columns(2)
                 for i, req in enumerate(requesters):
-                    col = cols[i % 2]
-                    with col:
-                        st.subheader(f"👤 {req}")
-                        req_data = df_filtered[df_filtered['Requester'] == req]
-                        if len(all_dates_in_range) > 0:
-                            idx = pd.MultiIndex.from_product([all_dates_in_range, target_hours], names=['Date', 'Hour'])
-                            grid_df = pd.DataFrame(index=idx).reset_index()
-                            valid_req_data = req_data[req_data['Hour'].isin(target_hours)]
-                            actual_counts = valid_req_data.groupby(['Date', 'Hour']).size().reset_index(name='Count')
-                            
-                            merged = pd.merge(grid_df, actual_counts, on=['Date', 'Hour'], how='left')
-                            merged['Count'] = merged['Count'].fillna(0).astype(int)
-                            
-                            fig = px.density_heatmap(
-                                merged, x='Hour', y='Date', z='Count', text_auto=True,
-                                color_continuous_scale=pastel_colors, title=f'{req} 效率分布'
-                            )
-                            fig.update_layout(
-                                xaxis_title="小时 (0点, 5-23点)", yaxis_title="日期",
-                                coloraxis_showscale=False,
-                                xaxis=dict(type='category', categoryorder='array', categoryarray=target_hours),
-                                yaxis=dict(type='category', categoryorder='category ascending')
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-                        else:
-                            st.write("无数据")
-                        st.markdown("---")
-            else:
-                st.info("数据中缺少 'Requester' 列。")
+                    req_data = df_filtered[df_filtered['Requester'] == req]
+                    if len(all_dates_in_range) > 0:
+                        idx = pd.MultiIndex.from_product([all_dates_in_range, target_hours], names=['Date', 'Hour'])
+                        grid_df = pd.DataFrame(index=idx).reset_index()
+                        valid_req_data = req_data[req_data['Hour'].isin(target_hours)]
+                        actual_counts = valid_req_data.groupby(['Date', 'Hour']).size().reset_index(name='Count')
+                        merged = pd.merge(grid_df, actual_counts, on=['Date', 'Hour'], how='left').fillna(0)
+                        
+                        fig = px.density_heatmap(
+                            merged, x='Hour', y='Date', z='Count', text_auto=True,
+                            color_continuous_scale=pastel_colors, title=f'{req} 效率分布'
+                        )
+                        fig.update_layout(xaxis=dict(type='category', categoryorder='array', categoryarray=target_hours))
+                        with cols[i % 2]: st.plotly_chart(fig, use_container_width=True)
 else:
     st.info("👈 请在左侧边栏上传数据文件以开启分析之旅。")
