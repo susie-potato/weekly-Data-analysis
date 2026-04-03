@@ -21,7 +21,7 @@ DEFAULT_NAME_LIST = [
     'v-yuanjunli@microsoft.com', 'v-yuqincheng@microsoft.com', 'v-wangjua@microsoft.com',
     'v-qingkzhang@microsoft.com', 'v-minshi1@microsoft.com', 'v-hengma@microsoft.com',
     'v-yingxli@microsoft.com', 'v-peilirao@microsoft.com', 'v-jiangqia@microsoft.com',
-    'v-chaozhao@microsoft.com', 'v-honlu@microsoft.com', 'v-huanyuluo@microsoft.com',
+    'v-chaozhao@microsoft.com', 'v-huanyuluo@microsoft.com',
     'v-liyuchen@microsoft.com'
 ]
 
