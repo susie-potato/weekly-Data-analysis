@@ -237,7 +237,7 @@ if uploaded_files:
                     time_pivot_reindexed = pivot.reindex(DEFAULT_NAME_LIST).fillna('-')
                     
                     # 给DataFrame应用上色样式 (Streamlit 渲染时极大地提升辨识度)
-                    styled_df = time_pivot_reindexed.style.applymap(highlight_abnormal_cells)
+                    styled_df = time_pivot_reindexed.style.map(highlight_abnormal_cells)
                     
                     st.dataframe(styled_df, use_container_width=True, height=650)
                     
